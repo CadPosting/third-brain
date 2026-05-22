@@ -1,0 +1,12 @@
+fastmcp
+lancedb
+pyarrow
+pandas
+sentence-transformers
+rank-bm25
+flashrank
+graphiti-core
+watchdog
+pyyaml
+python-frontmatter
+python-dotenv

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "third-brain": {
+      "command": "~/.third-brain/.venv/bin/python",
+      "args": ["~/.third-brain/server.py"],
+      "description": "Third Brain — shared semantic memory for all agents"
+    }
+  }
+}

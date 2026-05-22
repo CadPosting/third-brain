@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "third-brain": {
+      "command": "~/.third-brain/.venv/bin/python",
+      "args": ["~/.third-brain/server.py"],
+      "description": "Third Brain — shared semantic memory"
+    }
+  },
+  "hooks": {
+    "before_model_call": "python ~/.third-brain/hooks/inject.py",
+    "after_tool_use": "python ~/.third-brain/hooks/capture.py",
+    "session_end": "python ~/.third-brain/hooks/summarize.py"
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "command": "~/.third-brain/.venv/bin/python ~/.third-brain/hooks/inject.py",
+        "description": "Inject relevant Third Brain context before each prompt"
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": {"tool_name": ["Write", "Edit", "NotebookEdit"]},
+        "command": "~/.third-brain/.venv/bin/python ~/.third-brain/hooks/capture.py",
+        "description": "Auto-index any markdown file written or edited"
+      }
+    ],
+    "Stop": [
+      {
+        "command": "~/.third-brain/.venv/bin/python ~/.third-brain/hooks/summarize.py",
+        "description": "Save session summary to vault on session end"
+      }
+    ]
+  }
+}

@@ -1,0 +1,38 @@
+# Vault notes — personal content stays local
+vault/**/*.md
+!vault/**/_MOC.md
+!vault/HOME.md
+
+# Vector index — rebuilds automatically
+.lancedb/
+*.lance
+
+# Graph database
+graphiti.db
+graphiti/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Models — downloaded on first run
+models/
+
+# Environment
+.env
+*.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# LanceDB data
+data/
