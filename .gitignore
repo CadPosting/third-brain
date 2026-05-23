@@ -1,13 +1,5 @@
-# Vault notes — personal content stays local
-vault/**/*.md
-!vault/**/_MOC.md
-!vault/HOME.md
-
-# Obsidian internals — workspace state leaks open files, don't push
-vault/.obsidian/
-
-# Canvas files — personal scratch
-vault/**/*.canvas
+# Vault — all content stays local, nothing leaves the machine
+vault/
 
 # Vector index — rebuilds automatically
 .lancedb/
