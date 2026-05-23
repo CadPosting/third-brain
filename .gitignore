@@ -3,6 +3,12 @@ vault/**/*.md
 !vault/**/_MOC.md
 !vault/HOME.md
 
+# Obsidian internals — workspace state leaks open files, don't push
+vault/.obsidian/
+
+# Canvas files — personal scratch
+vault/**/*.canvas
+
 # Vector index — rebuilds automatically
 .lancedb/
 *.lance
