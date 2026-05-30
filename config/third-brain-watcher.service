@@ -1,0 +1,14 @@
+[Unit]
+Description=Third Brain Vault Watcher
+After=third-brain.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.third-brain
+ExecStart=%h/.third-brain/.venv/bin/python %h/.third-brain/watcher.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

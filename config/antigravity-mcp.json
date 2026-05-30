@@ -1,7 +1,6 @@
 {
   "third-brain": {
-    "command": "~/.third-brain/.venv/bin/python",
-    "args": ["~/.third-brain/server.py"],
+    "serverURL": "http://127.0.0.1:7891/mcp",
     "description": "Third Brain — shared semantic memory. Works with all models (Gemini, Claude, GPT, Codex)."
   }
 }

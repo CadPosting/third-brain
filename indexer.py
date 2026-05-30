@@ -26,7 +26,17 @@ SCHEMA = pa.schema([
 ])
 
 def _get_table():
-    global _db, _table
+    global _db, _table, _bm25
+    if _table is not None:
+        # Probe the handle with a cheap count — if the underlying files moved
+        # (e.g. index was wiped and rebuilt while the process was running),
+        # LanceDB raises an error. Catch it and reconnect.
+        try:
+            _table.count_rows()
+        except Exception:
+            _db = None
+            _table = None
+            _bm25 = None
     if _table is None:
         DB_PATH.mkdir(parents=True, exist_ok=True)
         _db = lancedb.connect(str(DB_PATH))
@@ -109,14 +119,25 @@ def index_file(file_path: str) -> int:
 
 def vector_search(query: str, top_k: int = 20, topic_filter: str = None) -> list[dict]:
     """Semantic search over all indexed chunks."""
-    table = _get_table()
+    global _db, _table, _bm25
     q_vec = embed(query)
-    search = table.search(q_vec).limit(top_k)
-    if topic_filter:
-        safe_topic = topic_filter.replace("'", "''")
-        search = search.where(f"topic = '{safe_topic}'")
-    results = search.to_pandas()
-    return results.to_dict("records")
+    for attempt in range(2):
+        try:
+            table = _get_table()
+            search = table.search(q_vec).limit(top_k)
+            if topic_filter:
+                safe_topic = topic_filter.replace("'", "''")
+                search = search.where(f"topic = '{safe_topic}'")
+            results = search.to_pandas()
+            return results.to_dict("records")
+        except Exception:
+            if attempt == 0:
+                # Force reconnect on next _get_table() call
+                _db = None
+                _table = None
+                _bm25 = None
+            else:
+                raise
 
 def bm25_search(query: str, top_k: int = 20) -> list[dict]:
     """Keyword search using BM25."""

@@ -1,0 +1,14 @@
+[Unit]
+Description=Third Brain MCP Memory Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.third-brain
+ExecStart=%h/.third-brain/.venv/bin/python %h/.third-brain/server.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

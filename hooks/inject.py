@@ -1,15 +1,18 @@
 """
 Hook: UserPromptSubmit
 Fires before the agent processes your message.
-Searches Third Brain for relevant context and injects it silently.
+POSTs to the always-running Third Brain server's /search endpoint
+so the embedding model is never loaded cold in this process.
+Fast path: ~50ms instead of ~20s.
 """
 import sys
 import json
+import urllib.request
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from indexer import vector_search, bm25_search, rrf_merge
-from reranker import rerank
+SEARCH_URL = "http://127.0.0.1:7891/search"
+TIMEOUT = 8  # seconds — must return fast or CC drops the hook output
+
 
 def main():
     try:
@@ -18,27 +21,34 @@ def main():
         if not prompt:
             sys.exit(0)
 
-        vec = vector_search(prompt, top_k=20)
-        bm25 = bm25_search(prompt, top_k=20)
-        merged = rrf_merge(vec, bm25)
-        results = rerank(prompt, merged, top_k=3)
+        body = json.dumps({"query": prompt, "top_k": 3}).encode()
+        req = urllib.request.Request(
+            SEARCH_URL,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            results = json.loads(resp.read())
 
-        if not results:
+        if not results or not isinstance(results, list):
             sys.exit(0)
 
         context_lines = ["--- Third Brain context ---"]
         for r in results:
             source = Path(r.get("source_path", "unknown")).name
-            context_lines.append(f"[{source}] {r.get('text', '').strip()}")
+            text = r.get("text", "").strip()
+            if text:
+                context_lines.append(f"[{source}] {text}")
         context_lines.append("--- end context ---")
 
-        # Output additionalContext for Claude Code hook protocol
         output = {"additionalContext": "\n".join(context_lines)}
         print(json.dumps(output))
 
     except Exception:
         # Never crash the agent session
         sys.exit(0)
+
 
 if __name__ == "__main__":
     main()
