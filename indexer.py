@@ -8,11 +8,14 @@ import json
 
 DB_PATH = Path.home() / ".third-brain" / "lancedb"
 TABLE_NAME = "chunks"
+VAULT_PATH = (Path.home() / "vault").resolve()
+EXCLUDED_DIRS = {".trash", ".obsidian"}  # Obsidian state / trashed notes must never reach recall
 
 _db = None
 _table = None
 _bm25 = None
 _bm25_docs: list[dict] = []
+_bm25_version = None  # table version the BM25 cache was built from
 
 SCHEMA = pa.schema([
     pa.field("id", pa.string()),
@@ -28,11 +31,13 @@ SCHEMA = pa.schema([
 def _get_table():
     global _db, _table, _bm25
     if _table is not None:
-        # Probe the handle with a cheap count — if the underlying files moved
-        # (e.g. index was wiped and rebuilt while the process was running),
-        # LanceDB raises an error. Catch it and reconnect.
+        # LanceDB handles are pinned to the version they were opened at, so
+        # without this sync, adds/deletes from other processes (watcher, hooks,
+        # manual scripts) stay invisible here until restart. Also doubles as
+        # the integrity probe: if the underlying files were wiped/rebuilt,
+        # it raises and we reconnect.
         try:
-            _table.count_rows()
+            _table.checkout_latest()
         except Exception:
             _db = None
             _table = None
@@ -47,7 +52,7 @@ def _get_table():
     return _table
 
 def _rebuild_bm25():
-    """Full rebuild — called on startup or after deletions."""
+    """Full rebuild — the BM25 cache mirrors the chunks table at one version."""
     global _bm25, _bm25_docs
     table = _get_table()
     rows = table.to_pandas()
@@ -59,22 +64,23 @@ def _rebuild_bm25():
     tokenized = [row["text"].lower().split() for row in _bm25_docs]
     _bm25 = BM25Okapi(tokenized)
 
-def _update_bm25(new_rows: list[dict]):
-    """Incremental update — append new chunks without reloading everything."""
-    global _bm25, _bm25_docs
-    if not new_rows:
-        return
-    if _bm25 is None:
-        _rebuild_bm25()
-        return
-    _bm25_docs.extend(new_rows)
-    tokenized = [row["text"].lower().split() for row in _bm25_docs]
-    _bm25 = BM25Okapi(tokenized)
+def remove_file(file_path: str) -> None:
+    """Drop all chunks for a deleted or moved-away file (or directory subtree)."""
+    table = _get_table()
+    safe = str(file_path).replace("'", "''")
+    table.delete(f"source_path = '{safe}' OR source_path LIKE '{safe}/%'")
 
 def index_file(file_path: str) -> int:
     """Parse a markdown file, chunk it, embed each chunk, store in LanceDB."""
     path = Path(file_path)
     if not path.exists() or not path.suffix == ".md":
+        return 0
+    resolved = path.resolve()
+    # Only real vault notes may enter the index — nothing outside ~/vault and
+    # nothing under .trash/.obsidian, no matter which caller asks (hook, watcher,
+    # MCP capture, manual rebuild). Guarding only in capture.py left every other
+    # entry point open — that's how 34% of the index became pollution once.
+    if VAULT_PATH not in resolved.parents or any(p in EXCLUDED_DIRS for p in resolved.parts):
         return 0
 
     post = frontmatter.load(str(path))
@@ -113,7 +119,8 @@ def index_file(file_path: str) -> int:
 
     if rows:
         table.add(rows)
-        _update_bm25(rows)
+        # No BM25 update here — the add bumps the table version, and
+        # bm25_search rebuilds its cache whenever the version moves.
 
     return len(rows)
 
@@ -141,8 +148,13 @@ def vector_search(query: str, top_k: int = 20, topic_filter: str = None) -> list
 
 def bm25_search(query: str, top_k: int = 20) -> list[dict]:
     """Keyword search using BM25."""
-    if _bm25 is None:
+    global _bm25_version
+    current = _get_table().version
+    if _bm25 is None or current != _bm25_version:
+        # Any add/delete — from this or another process — bumps the table
+        # version, so a moved version means the cache no longer mirrors it.
         _rebuild_bm25()
+        _bm25_version = current
     if _bm25 is None:
         return []
     scores = _bm25.get_scores(query.lower().split())

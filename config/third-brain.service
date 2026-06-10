@@ -8,6 +8,10 @@ WorkingDirectory=%h/.third-brain
 ExecStart=%h/.third-brain/.venv/bin/python %h/.third-brain/server.py
 Restart=always
 RestartSec=5
+# uvicorn's graceful shutdown can hang while MCP/hook clients hold connections
+# open; without a short stop timeout the old process keeps port 7891 and every
+# restart crash-loops on "address already in use".
+TimeoutStopSec=10
 Environment=PYTHONUNBUFFERED=1
 
 [Install]

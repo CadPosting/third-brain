@@ -190,7 +190,9 @@ The server pre-warms the embedder and reranker on startup — first search takes
 
 ### 5. Connect Claude Code
 
-**Step 1 — MCP config** (`~/.claude/mcp.json`):
+> **⚠️ Prerequisite — check `CLAUDE_CONFIG_DIR` first.** Run `echo $CLAUDE_CONFIG_DIR`. If it is set, Claude Code reads its config from **that** directory, **not** `~/.claude`. In every path below, substitute `$CLAUDE_CONFIG_DIR` for `~/.claude`, and note that the MCP registration lives in the **`mcpServers` key of `$CLAUDE_CONFIG_DIR/.claude.json`** — not a separate `mcp.json`. Configuring `~/.claude/*` while `CLAUDE_CONFIG_DIR` is set is the #1 cause of "the server is running but MCP tools never appear and hooks never fire" — the files exist but Claude Code ignores them. The simplest reliable setup is `claude mcp add --scope user --transport http third-brain http://127.0.0.1:7891/mcp`, which writes to the correct file automatically regardless of `CLAUDE_CONFIG_DIR`.
+
+**Step 1 — MCP config** (`~/.claude/mcp.json`, or the `mcpServers` key of `$CLAUDE_CONFIG_DIR/.claude.json` if that var is set):
 
 ```bash
 cp config/claude-mcp.json ~/.claude/mcp.json
@@ -210,9 +212,9 @@ This tells Claude Code to connect to the running server via HTTP. The config use
 }
 ```
 
-**Step 2 — Hooks** (`~/.claude/settings.json`):
+**Step 2 — Hooks** (`~/.claude/settings.json`, or `$CLAUDE_CONFIG_DIR/settings.json` if that var is set):
 
-Merge the `hooks` block from `config/claude-settings.json` into your existing `~/.claude/settings.json`. Do **not** replace the whole file — only add the `hooks` key.
+Merge the `hooks` block from `config/claude-settings.json` into your existing settings file. Do **not** replace the whole file — only add the `hooks` key.
 
 ```json
 {
@@ -354,7 +356,7 @@ The Stop hook reads `transcript_path` from the payload — a path to the `.jsonl
 2. `~/vault/projects/` exists
 3. The session had at least 2 user messages (trivial sessions are skipped)
 
-Claude Code (VSCode extension) stores transcripts at `~/Documents/claude/projects/-home-<user>/<session-id>.jsonl`. The `transcript_path` in the hook payload resolves this correctly.
+Claude Code stores transcripts at `$CLAUDE_CONFIG_DIR/projects/-<cwd-slug>/<session-id>.jsonl` (default `~/.claude/projects/`). The `transcript_path` in the hook payload resolves this correctly either way.
 
 ### LanceDB corruption / "Not Found" errors
 

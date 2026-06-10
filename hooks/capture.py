@@ -27,6 +27,15 @@ def main():
         if not file_path or not file_path.endswith(".md"):
             sys.exit(0)
 
+        # Only index files INSIDE the vault. Without this guard, every .md the
+        # agent edits (global CLAUDE.md, GEMINI.md, skill docs, this repo's
+        # README) gets indexed and pollutes recall — the server/watcher/indexer
+        # are all vault-scoped, so this hook is the only leak.
+        vault = (Path.home() / "vault").resolve()
+        resolved = Path(file_path).resolve()
+        if resolved != vault and vault not in resolved.parents:
+            sys.exit(0)
+
         # Re-index the file that was just written/edited
         chunks = index_file(file_path)
 

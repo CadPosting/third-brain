@@ -11,7 +11,9 @@ import urllib.request
 from pathlib import Path
 
 SEARCH_URL = "http://127.0.0.1:7891/search"
-TIMEOUT = 8  # seconds — must return fast or CC drops the hook output
+TIMEOUT = 12  # seconds — must return fast or CC drops the hook output.
+# Steady-state /search is ~4-6s; 12s leaves headroom so a slow query
+# doesn't silently drop recall context (the except clause exits 0).
 
 
 def main():
