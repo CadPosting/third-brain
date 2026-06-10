@@ -5,17 +5,25 @@ Exposes recall, remember, graph_traverse, and list_map to all connected agents.
 Runs as a persistent HTTP server on http://127.0.0.1:7891/mcp
 Managed by systemd: systemctl --user start third-brain
 """
+import os
 from pathlib import Path
 from datetime import datetime
 import frontmatter as fm
 
 from fastmcp import FastMCP
-from indexer import index_file, vector_search, bm25_search, rrf_merge
+from indexer import index_file, vector_search, bm25_search, rrf_merge, find_similar_note
 from reranker import rerank
 from graph import add_episode, search_graph, is_available as graph_available
 from classifier import classify, resolve_vault_path, build_frontmatter
 
 VAULT_PATH = Path.home() / "vault"
+
+# Write-time dedup: before creating a new note, if an existing note in the same
+# domain folder is at least this cosine-similar, append to it instead of making
+# a near-duplicate sibling. Calibrated start point; lower toward 0.80 if dupes
+# still slip through. Disable entirely with TB_DEDUP=0.
+DEDUP_SIM = 0.85
+DEDUP_MAX_BYTES = 8192  # don't accrete into a note past this size — make a new one
 
 mcp = FastMCP("third-brain")
 
@@ -57,6 +65,80 @@ async def recall(
     ]
 
 
+async def _do_remember(
+    content: str,
+    title: str = None,
+    agent: str = "agent",
+    tags: list[str] = None,
+    domain: str = None,
+) -> dict:
+    """Core write path shared by the MCP `remember` tool and the /remember
+    HTTP route (used by the session fact-extractor hook)."""
+    tags = tags or []
+
+    if domain:
+        # Agent knows the domain — use it directly.
+        # classify() with a known domain still handles MOC bootstrapping
+        # for new domains via the side-effect in _bootstrap_domain.
+        folder = domain.strip().lower().replace(" ", "-")
+        # Ensure MOC exists for this domain if it's new
+        from classifier import _score_against_mocs, _bootstrap_domain, _find_moc, VAULT_PATH
+        domain_dir = VAULT_PATH / folder.split("/")[0]
+        if _find_moc(domain_dir) is None:
+            related = [
+                d for d, s in _score_against_mocs(content).items() if s > 0.15
+            ]
+            _bootstrap_domain(folder.split("/")[0], content, related)
+    else:
+        folder = classify(content)
+
+    title = title or _auto_title(content)
+    note_path = resolve_vault_path(folder, title)
+    note_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Write-time dedup. Only worth attempting when the title doesn't already
+    # resolve to an existing note (that case is handled by the append branch
+    # below). If a same-domain note is similar enough and passes the rails,
+    # redirect the write into it so it appends instead of creating a sibling.
+    deduped_into = None
+    if os.environ.get("TB_DEDUP", "1") != "0" and not note_path.exists():
+        match = find_similar_note(content, str(note_path.parent) + "/")
+        if match:
+            cand_path, sim = match
+            cand = Path(cand_path)
+            is_moc = "MOC" in cand.name or cand.name == "HOME.md"
+            small_enough = cand.exists() and cand.stat().st_size <= DEDUP_MAX_BYTES
+            if sim >= DEDUP_SIM and not is_moc and small_enough:
+                note_path = cand
+                deduped_into = cand_path
+
+    # Append to existing note or create new
+    if note_path.exists():
+        existing = fm.load(str(note_path))
+        existing.content += f"\n\n---\n*{agent} — {datetime.now().strftime('%Y-%m-%d %H:%M')}*\n\n{content}"
+        with open(note_path, "w") as f:
+            f.write(fm.dumps(existing))
+    else:
+        frontmatter_str = build_frontmatter(folder, "", tags, agent)
+        note_path.write_text(frontmatter_str + content)
+
+    # Index the note
+    chunks = index_file(str(note_path))
+
+    # Add to knowledge graph
+    if graph_available():
+        await add_episode(content, source=agent)
+
+    return {
+        "status": "saved",
+        "path": str(note_path),
+        "folder": folder,
+        "chunks_indexed": chunks,
+        "deduped_into": deduped_into,
+        "new_domain_created": _find_moc(VAULT_PATH / folder.split("/")[0]) is None,
+    }
+
+
 @mcp.tool()
 async def remember(
     content: str,
@@ -84,52 +166,7 @@ async def remember(
         domain:  Explicit domain name or subfolder (e.g. 'networking',
                  'machine-learning/alignment'). Preferred over auto-classify.
     """
-    tags = tags or []
-
-    if domain:
-        # Agent knows the domain — use it directly.
-        # classify() with a known domain still handles MOC bootstrapping
-        # for new domains via the side-effect in _bootstrap_domain.
-        folder = domain.strip().lower().replace(" ", "-")
-        # Ensure MOC exists for this domain if it's new
-        from classifier import _score_against_mocs, _bootstrap_domain, _find_moc, VAULT_PATH
-        domain_dir = VAULT_PATH / folder.split("/")[0]
-        if _find_moc(domain_dir) is None:
-            related = [
-                d for d, s in _score_against_mocs(content).items() if s > 0.15
-            ]
-            _bootstrap_domain(folder.split("/")[0], content, related)
-    else:
-        folder = classify(content)
-
-    title = title or _auto_title(content)
-    note_path = resolve_vault_path(folder, title)
-    note_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Append to existing note or create new
-    if note_path.exists():
-        existing = fm.load(str(note_path))
-        existing.content += f"\n\n---\n*{agent} — {datetime.now().strftime('%Y-%m-%d %H:%M')}*\n\n{content}"
-        with open(note_path, "w") as f:
-            f.write(fm.dumps(existing))
-    else:
-        frontmatter_str = build_frontmatter(folder, "", tags, agent)
-        note_path.write_text(frontmatter_str + content)
-
-    # Index the note
-    chunks = index_file(str(note_path))
-
-    # Add to knowledge graph
-    if graph_available():
-        await add_episode(content, source=agent)
-
-    return {
-        "status": "saved",
-        "path": str(note_path),
-        "folder": folder,
-        "chunks_indexed": chunks,
-        "new_domain_created": _find_moc(VAULT_PATH / folder.split("/")[0]) is None,
-    }
+    return await _do_remember(content, title=title, agent=agent, tags=tags, domain=domain)
 
 
 @mcp.tool()
@@ -269,14 +306,58 @@ async def search_endpoint(request) -> "Response":
         body = await request.json()
         query = body.get("query", "")
         top_k = int(body.get("top_k", 3))
+        # Optional relevance gate: drop results whose cross-encoder rerank score
+        # is below this. Clients (inject.py) use it so weak/irrelevant prompts
+        # inject nothing instead of always pulling top_k. Default 0.0 = no gate.
+        min_score = float(body.get("min_score", 0.0))
         if not query:
             return JSONResponse([], status_code=200)
         vec = vector_search(query, top_k=top_k * 4)
         bm25 = bm25_search(query, top_k=top_k * 4)
         merged = rrf_merge(vec, bm25)
         results = rerank(query, merged, top_k=top_k)
-        trimmed = [{"source_path": r.get("source_path", ""), "text": r.get("text", "")} for r in results]
+        trimmed = [
+            {
+                "source_path": r.get("source_path", ""),
+                "text": r.get("text", ""),
+                "score": round(float(r.get("rerank_score", 0.0)), 4),
+            }
+            for r in results
+            if float(r.get("rerank_score", 0.0)) >= min_score
+        ]
         return JSONResponse(trimmed)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/remember", methods=["POST"])
+async def remember_endpoint(request) -> "Response":
+    """
+    Plain JSON write endpoint for hooks/scripts (e.g. the session fact-extractor)
+    that can't speak MCP. Shares the exact write path — including Phase 3 dedup —
+    with the MCP `remember` tool.
+    POST {"content": "...", "domain": "...", "title": "...", "agent": "...", "tags": [...]}
+    """
+    from starlette.responses import JSONResponse
+    try:
+        body = await request.json()
+        content = (body.get("content") or "").strip()
+        if not content:
+            return JSONResponse({"error": "empty content"}, status_code=400)
+        # domain flows into a filesystem path and, via this HTTP route, can come
+        # from an LLM reading an untrusted transcript. Reject path-traversal
+        # patterns while still allowing legit subdomains like "a/b".
+        domain = body.get("domain")
+        if domain and (".." in domain or domain.startswith("/") or "\\" in domain):
+            return JSONResponse({"error": "invalid domain"}, status_code=400)
+        result = await _do_remember(
+            content,
+            title=body.get("title"),
+            agent=body.get("agent", "agent"),
+            tags=body.get("tags"),
+            domain=domain,
+        )
+        return JSONResponse(result)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 

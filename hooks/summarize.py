@@ -5,6 +5,7 @@ CC sends: { "session_id", "transcript_path", "cwd", "hook_event_name" }
 Reads the transcript from transcript_path (a .jsonl file), then writes
 a structured session note to vault/projects/ and indexes it.
 """
+import os
 import sys
 import json
 from pathlib import Path
@@ -78,11 +79,18 @@ def summarize_transcript(transcript: str) -> str:
 
 def main():
     try:
+        # Recursion guard: the fact-extractor spawns `claude -p`, which fires
+        # its own Stop hook. That subprocess inherits TB_NO_EXTRACT=1, so we
+        # bail here and never summarize the extractor's own throwaway session.
+        if os.environ.get("TB_NO_EXTRACT"):
+            sys.exit(0)
+
         raw = sys.stdin.read()
         if not raw.strip():
             sys.exit(0)
 
         payload = json.loads(raw)
+        session_id = payload.get("session_id", "")
 
         # Primary path: CC sends transcript_path pointing to the .jsonl file
         transcript_path = payload.get("transcript_path", "")
@@ -90,7 +98,6 @@ def main():
             transcript = read_transcript_jsonl(transcript_path)
         else:
             # Fallback: reconstruct path from session_id + cwd
-            session_id = payload.get("session_id", "")
             cwd = payload.get("cwd", "")
             if session_id and cwd:
                 slug = cwd.replace("/", "-").lstrip("-")
@@ -106,8 +113,23 @@ def main():
         if not summary:
             sys.exit(0)
 
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
-        note_path = VAULT_PATH / "projects" / f"session-{timestamp}.md"
+        # Name the note by session, not by wall-clock minute. The Stop hook
+        # fires at the end of EVERY turn, so a minute-stamped filename produced
+        # one note per turn (the 24-duplicate-sessions bug). Keying on
+        # session_id means a session overwrites its own note in place — an
+        # upsert. index_file() drops the path's old chunks before re-adding,
+        # so the index stays consistent on overwrite.
+        today = datetime.now().strftime("%Y-%m-%d")
+        # Keep only safe chars before putting session_id in a path — a crafted
+        # id like "../../x" would otherwise escape the projects/ folder.
+        safe_sid = "".join(c for c in session_id if c.isalnum())[:8]
+        if safe_sid:
+            label = f"{today}-{safe_sid}"
+        else:
+            # No session_id (older CC / manual call) — fall back to the old
+            # minute-stamped name so we still capture something.
+            label = datetime.now().strftime("%Y-%m-%d_%H-%M")
+        note_path = VAULT_PATH / "projects" / f"session-{label}.md"
         note_path.parent.mkdir(parents=True, exist_ok=True)
 
         note_path.write_text(f"""---
@@ -115,10 +137,11 @@ topic: projects
 subtopic: sessions
 tags: [session, auto]
 agent: claude-code
-last_updated: {datetime.now().strftime('%Y-%m-%d')}
+session_id: {safe_sid}
+last_updated: {today}
 ---
 
-# Session {timestamp}
+# Session {label}
 
 {summary}
 

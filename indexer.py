@@ -124,6 +124,43 @@ def index_file(file_path: str) -> int:
 
     return len(rows)
 
+def find_similar_note(content: str, dir_prefix: str) -> tuple[str, float] | None:
+    """Find the most similar existing note within a directory subtree.
+
+    Used for write-time dedup: before creating a new note, check whether one
+    already covers this content. Scoped to dir_prefix (same domain folder) —
+    cross-domain merging is how wrong merges happen. Returns
+    (source_path, cosine_similarity) of the best match, or None.
+
+    Cosine is computed as a direct dot product of the (L2-normalized) vectors,
+    so it does not depend on LanceDB's distance metric.
+    """
+    if not content.strip():
+        return None
+    q_vec = embed_passage(content)
+    try:
+        table = _get_table()
+        safe_prefix = dir_prefix.replace("'", "''")
+        # Pull a few candidates, not just the nearest: the single closest may be
+        # a MOC/HOME index file (never a valid merge target), and we don't want
+        # that to mask a genuine near-duplicate sitting just behind it.
+        res = (
+            table.search(q_vec)
+            .where(f"source_path LIKE '{safe_prefix}%'")
+            .limit(5)
+            .to_pandas()
+        )
+    except Exception:
+        return None
+    for _, row in res.iterrows():
+        name = Path(str(row["source_path"])).name
+        if "MOC" in name or name == "HOME.md":
+            continue
+        sim = sum(a * b for a, b in zip(q_vec, row["vector"]))
+        return str(row["source_path"]), float(sim)
+    return None
+
+
 def vector_search(query: str, top_k: int = 20, topic_filter: str = None) -> list[dict]:
     """Semantic search over all indexed chunks."""
     global _db, _table, _bm25
