@@ -615,7 +615,7 @@
     ],
     "defaultMode": "bypassPermissions"
   },
-  "effortLevel": "high",
+  "effortLevel": "low",
   "theme": "dark",
   "hooks": {
     "UserPromptSubmit": [
