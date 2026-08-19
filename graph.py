@@ -68,4 +68,40 @@ async def search_graph(query: str, top_k: int = 5) -> list[dict]:
     ]
 
 def is_available() -> bool:
-    return _GRAPHITI_AVAILABLE
+    """True only when the graph layer can actually be USED, not merely imported.
+
+    The import flag alone is not enough. When graphiti-core is installed but
+    Neo4j is not running, every caller passed this gate and then blocked inside
+    Graphiti's Bolt driver, which has no connect timeout of its own — that is
+    what made `recall` hang past the 300s MCP tool timeout while the server
+    looked alive. Checked here, once, because every call site is `if
+    graph_available(): await search_graph(...)`.
+    """
+    if not _GRAPHITI_AVAILABLE:
+        return False
+    if not os.environ.get("NEO4J_PASSWORD", ""):
+        return False
+    return _bolt_reachable()
+
+
+# Cached so a dead Neo4j costs one 0.3s probe per process, not one per query.
+# None = not yet probed. A restart re-probes, which is the intended way to pick
+# up a Neo4j that came up later.
+_reachable = None
+
+
+def _bolt_reachable(timeout: float = 0.3) -> bool:
+    global _reachable
+    if _reachable is not None:
+        return _reachable
+    import socket
+    from urllib.parse import urlparse
+    parsed = urlparse(os.environ.get("NEO4J_URI", "bolt://localhost:7687"))
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 7687
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            _reachable = True
+    except OSError:
+        _reachable = False
+    return _reachable

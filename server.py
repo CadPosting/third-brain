@@ -15,6 +15,10 @@ from indexer import index_file, vector_search, bm25_search, rrf_merge, find_simi
 from reranker import rerank
 from graph import add_episode, search_graph, is_available as graph_available
 from classifier import classify, resolve_vault_path, build_frontmatter
+# Module import too: the write path reaches for the private helpers
+# (_find_moc, _score_against_mocs, _bootstrap_domain) via the module rather
+# than name-importing each one.
+import classifier
 
 VAULT_PATH = Path.home() / "vault"
 
@@ -43,16 +47,48 @@ async def recall(
         top_k: Number of results to return (default 5).
         topic_filter: Limit to a domain e.g. 'machine-learning', 'hpc', 'web-development'.
     """
+    # Stage tracing, off unless TB_TRACE=1. This is what localised the reranker
+    # deadlock (every stage before rerank finished in 0.3s); keep it available,
+    # quiet by default.
+    import sys, os as _os, time as _t
+    _trace = _os.environ.get("TB_TRACE", "0") == "1"
+    def _stage(msg):
+        if _trace:
+            print(f"[recall] {msg}", file=sys.stderr, flush=True)
+    _t0 = _t.time()
+    _stage(f"start query={query!r} top_k={top_k}")
     vec = vector_search(query, top_k=20, topic_filter=topic_filter)
+    _stage(f"vector_search done n={len(vec)} t={_t.time()-_t0:.1f}s")
     bm25 = bm25_search(query, top_k=20)
+    _stage(f"bm25_search done n={len(bm25)} t={_t.time()-_t0:.1f}s")
     merged = rrf_merge(vec, bm25)
+    _stage(f"rrf_merge done n={len(merged)} t={_t.time()-_t0:.1f}s")
 
     # Add graph results if available
     if graph_available():
         graph_results = await search_graph(query, top_k=5)
         merged = merged + graph_results
+    _stage(f"graph stage done t={_t.time()-_t0:.1f}s")
 
-    reranked = rerank(query, merged, top_k=top_k)
+    # rerank() is synchronous ONNX inference. Called directly it blocks FastMCP's
+    # event loop, so the server cannot even answer a health check while it runs;
+    # to_thread keeps the loop free. The timeout is the safety net that turns a
+    # wedged reranker into a degraded-but-answered query instead of a hang past
+    # the client's 300s tool timeout — vector+BM25 results are already RRF-merged
+    # and useful on their own.
+    import asyncio
+    try:
+        reranked = await asyncio.wait_for(
+            asyncio.to_thread(rerank, query, merged, top_k=top_k), timeout=25
+        )
+        _stage(f"rerank done n={len(reranked)} t={_t.time()-_t0:.1f}s")
+    except (asyncio.TimeoutError, RuntimeError, ValueError, OSError) as e:
+        # Always logged, not gated behind TB_TRACE: this means results came back
+        # unreranked (score 0), which is a real quality degradation worth seeing.
+        print(f"[recall] rerank FAILED ({type(e).__name__}) after "
+              f"t={_t.time()-_t0:.1f}s — returning RRF-merged results unreranked",
+              file=sys.stderr, flush=True)
+        reranked = merged[:top_k]
 
     return [
         {
@@ -76,21 +112,39 @@ async def _do_remember(
     HTTP route (used by the session fact-extractor hook)."""
     tags = tags or []
 
-    if domain:
-        # Agent knows the domain — use it directly.
-        # classify() with a known domain still handles MOC bootstrapping
-        # for new domains via the side-effect in _bootstrap_domain.
-        folder = domain.strip().lower().replace(" ", "-")
-        # Ensure MOC exists for this domain if it's new
-        from classifier import _score_against_mocs, _bootstrap_domain, _find_moc, VAULT_PATH
-        domain_dir = VAULT_PATH / folder.split("/")[0]
-        if _find_moc(domain_dir) is None:
-            related = [
-                d for d, s in _score_against_mocs(content).items() if s > 0.15
-            ]
-            _bootstrap_domain(folder.split("/")[0], content, related)
-    else:
-        folder = classify(content)
+    # Both branches below run embedding work (_score_against_mocs embeds the
+    # content against every domain MOC; classify() does the same internally and
+    # was measured at 20.8s standalone). They are synchronous, so calling them
+    # directly here blocks FastMCP's event loop for the whole duration — which is
+    # how `remember` came to hang past the client's 300s tool timeout while the
+    # request sat logged as received and never completed. Offload to a thread.
+    import asyncio
+
+    def _resolve_folder() -> str:
+        if domain:
+            # Agent knows the domain — use it directly.
+            folder = domain.strip().lower().replace(" ", "-")
+            # Bootstrap a MOC only for a genuinely new domain. For an existing
+            # one this whole branch is skipped, which avoids the MOC-scoring
+            # embed entirely on the common path.
+            domain_dir = classifier.VAULT_PATH / folder.split("/")[0]
+            if classifier._find_moc(domain_dir) is None:
+                related = [
+                    d for d, s in classifier._score_against_mocs(content).items() if s > 0.15
+                ]
+                classifier._bootstrap_domain(folder.split("/")[0], content, related)
+            return folder
+        return classify(content)
+
+    try:
+        folder = await asyncio.wait_for(asyncio.to_thread(_resolve_folder), timeout=60)
+    except asyncio.TimeoutError:
+        # Never lose a write to a slow classifier. An explicit domain is already
+        # the caller's answer; without one, park the note in `inbox` so it is on
+        # disk and indexed, and can be refiled later.
+        folder = (domain.strip().lower().replace(" ", "-") if domain else "inbox")
+        print(f"[remember] folder resolution timed out — using {folder!r}",
+              file=__import__("sys").stderr, flush=True)
 
     title = title or _auto_title(content)
     note_path = resolve_vault_path(folder, title)
@@ -102,7 +156,19 @@ async def _do_remember(
     # redirect the write into it so it appends instead of creating a sibling.
     deduped_into = None
     if os.environ.get("TB_DEDUP", "1") != "0" and not note_path.exists():
-        match = find_similar_note(content, str(note_path.parent) + "/")
+        # Also embedding work, also synchronous — same event-loop reasoning as
+        # the folder resolution above. Measured at 0.2s, so the timeout here is
+        # a guard rather than an expected path; on timeout we simply skip dedup
+        # and write a new note, which is the safe direction to fail.
+        try:
+            match = await asyncio.wait_for(
+                asyncio.to_thread(find_similar_note, content, str(note_path.parent) + "/"),
+                timeout=30,
+            )
+        except asyncio.TimeoutError:
+            match = None
+            print("[remember] dedup lookup timed out — writing a new note",
+                  file=__import__("sys").stderr, flush=True)
         if match:
             cand_path, sim = match
             cand = Path(cand_path)
@@ -135,7 +201,9 @@ async def _do_remember(
         "folder": folder,
         "chunks_indexed": chunks,
         "deduped_into": deduped_into,
-        "new_domain_created": _find_moc(VAULT_PATH / folder.split("/")[0]) is None,
+        "new_domain_created": classifier._find_moc(
+            VAULT_PATH / folder.split("/")[0]
+        ) is None,
     }
 
 
