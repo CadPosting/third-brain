@@ -41,7 +41,7 @@ Every agent reads from and writes to the same vault. A decision made in a Claude
 | FlashRank `ms-marco-MiniLM-L-12-v2` | Reranks top-20 results (~4MB) |
 | watchdog | Auto-indexes any vault file change within 2 seconds |
 | FastMCP 3.3.1 | HTTP MCP server all agents connect to |
-| Graphiti | Knowledge graph layer (optional — requires Neo4j) |
+| Graphiti | Knowledge graph layer (optional — skipped unless Neo4j is reachable) |
 
 ---
 
@@ -161,13 +161,26 @@ pip install -r requirements.txt
 cp -r vault ~/vault
 ```
 
-### 3. Configure environment (optional — knowledge graph layer)
+### 3. Configure environment
 
 ```bash
 cp .env.example ~/.third-brain/.env
 # Set NEO4J_PASSWORD if you have Neo4j running locally
 # Leave blank to skip the graph layer — vector + BM25 + reranker still work
 ```
+
+Every variable is optional. The system runs on defaults with no `.env` at all.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `NEO4J_PASSWORD` | *(unset)* | Enables the graph layer. Blank means the graph is skipped entirely. |
+| `NEO4J_URI` | `bolt://localhost:7687` | Where to reach Neo4j. |
+| `NEO4J_USER` | `neo4j` | Neo4j username. |
+| `TB_DEDUP` | `1` | Set to `0` to disable dedup — every `remember` writes a new note instead of appending to a near-identical one. |
+| `TB_TRACE` | `0` | Set to `1` to print per-stage timings for `recall` to stderr. This is the switch to reach for when a search feels slow: it shows which of vector / BM25 / RRF / graph / rerank is eating the time. |
+| `TB_NO_EXTRACT` | *(unset)* | Set to disable the session fact-extraction hook. |
+
+The graph layer checks whether Neo4j is genuinely reachable, not just whether `graphiti-core` imports. If the package is installed but nothing is listening on the Bolt port, the graph stage is skipped and search runs on vector + BM25 + reranker. The probe costs one 0.3s socket check per process and is cached, so restart the server if you start Neo4j later.
 
 ### 4. Install and start the background services
 
@@ -327,6 +340,27 @@ curl -s http://127.0.0.1:7891/search \
 ```
 
 After connecting an agent, start a session and send a message. The agent should call `recall` before responding. After the session ends, check `~/vault/projects/` — a `session-YYYY-MM-DD_HH-MM.md` file should appear.
+
+---
+
+## Degraded modes
+
+A slow stage never hangs a request. Each one has a deadline, and blowing it costs quality rather than the whole call — an answer that is worse is better than a client that times out at 300s with nothing.
+
+| Stage | Deadline | What happens instead |
+|---|---|---|
+| Reranking in `recall` | 25s | Returns the RRF-merged results unreranked, all scored 0. Ordering is worse but the results are real. |
+| Folder resolution in `remember` | 60s | Uses the domain you passed. Without one, the note lands in `inbox` — still written, still indexed, refile later. |
+| Dedup lookup in `remember` | 30s | Skips dedup and writes a new note. Never merges into the wrong one. |
+| Graph search | *n/a* | Skipped when Neo4j is unreachable. See the environment table above. |
+
+Both `remember` fallbacks and the rerank fallback log to stderr whether or not `TB_TRACE` is on, because each one means the result you got is not the result you would normally get:
+
+```bash
+journalctl --user -u third-brain -n 50 | grep -E "rerank FAILED|timed out"
+```
+
+If those lines show up regularly rather than occasionally, something upstream is wrong — usually memory pressure on the ONNX reranker or an embedding model reloading per call. Set `TB_TRACE=1` and restart to see the per-stage breakdown.
 
 ---
 
