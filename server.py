@@ -186,7 +186,11 @@ async def _do_remember(
             f.write(fm.dumps(existing))
     else:
         frontmatter_str = build_frontmatter(folder, "", tags, agent)
-        note_path.write_text(frontmatter_str + content)
+        # Link back to the domain MOC so the note isn't an orphan in Obsidian's
+        # graph — without this, every remember() note had zero links.
+        moc = classifier._find_moc(VAULT_PATH / folder.split("/")[0])
+        footer = f"\n\n---\n*[[{moc.stem}]]*\n" if moc and moc.stem.endswith(" MOC") else ""
+        note_path.write_text(frontmatter_str + content + footer)
 
     # Index the note
     chunks = index_file(str(note_path))

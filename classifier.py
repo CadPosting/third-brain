@@ -102,10 +102,8 @@ def _find_moc(domain_dir: Path) -> Path | None:
         return canonical
     # Fall back: any file ending in " MOC.md"
     candidates = list(domain_dir.glob("* MOC.md"))
-    if candidates:
-        return candidates[0]
-    # Last resort: any .md in folder root
-    candidates = list(domain_dir.glob("*.md"))
+    # No "any .md" fallback: treating an ordinary note as the MOC meant a domain
+    # created without one (e.g. education/) was never bootstrapped.
     return candidates[0] if candidates else None
 
 
