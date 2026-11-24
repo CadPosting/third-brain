@@ -17,6 +17,25 @@ VAULT_PATH = Path.home() / "vault"
 # Cosine similarity below this → content is a new domain
 NEW_DOMAIN_THRESHOLD = 0.30
 
+# Old or near-duplicate domain names -> the canonical folder (merged 2026-11-24).
+# remember(domain="web-dev") lands in web-development instead of recreating it.
+DOMAIN_ALIASES = {
+    "web": "web-development",
+    "web-dev": "web-development",
+    "webdev": "web-development",
+    "web-analytics": "web-development/analytics",
+    "workflow": "workflow-preferences",
+    "linux": "linux-desktop",
+}
+
+
+def canonical_domain(domain: str) -> str:
+    """Map an alias (or alias/sub/path) to its canonical folder."""
+    head, _, rest = domain.partition("/")
+    base = DOMAIN_ALIASES.get(head, head)
+    return f"{base}/{rest}" if rest else base
+
+
 # Folders that are not top-level domains (skip when scanning MOCs)
 SYSTEM_FOLDERS = {"projects"}
 
@@ -118,38 +137,96 @@ def related_domains(scores: dict[str, float], limit: int = 3) -> list[str]:
     return [d for d, s in ranked[:limit] if s >= 0.5 and s >= best - 0.05]
 
 
-def link_note_in_moc(note_path: Path) -> None:
-    """Add a [[link]] to note_path under the "## Notes" section of its domain MOC.
-
-    Notes only linked *to* their MOC (footer) still show as orphans: nothing
-    points at them. This gives each note one incoming link.
-    """
-    try:
-        rel = note_path.resolve().relative_to(VAULT_PATH.resolve())
-    except ValueError:
-        return
-    moc = _find_moc(VAULT_PATH / rel.parts[0])
-    if moc is None or moc.resolve() == note_path.resolve():
-        return
-    link = f"[[{note_path.stem}]]"
+def _add_line_under(moc: Path, heading: str, line: str) -> None:
+    """Insert `line` under `heading` in moc (creating the section if missing)."""
     text = moc.read_text(errors="ignore")
-    if link in text:
+    if line in text:
         return
-    line = f"- {link}"
-    if "## Notes" in text:
-        head, _, tail = text.partition("## Notes")
-        # Insert after the heading's own line (and any blockquote placeholder).
+    if heading in text:
+        head, _, tail = text.partition(heading)
         lines = tail.split("\n")
         i = 1
         while i < len(lines) and (lines[i].startswith(">") or not lines[i].strip()):
             i += 1
         lines.insert(i, line)
-        text = head + "## Notes" + "\n".join(lines)
-        if not text.endswith("\n"):
-            text += "\n"
+        text = head + heading + "\n".join(lines)
     else:
-        text = text.rstrip() + f"\n\n## Notes\n\n{line}\n"
+        text = text.rstrip() + f"\n\n{heading}\n\n{line}\n"
+    if not text.endswith("\n"):
+        text += "\n"
     moc.write_text(text)
+
+
+def ensure_sub_moc(folder: Path, name: str | None = None) -> Path:
+    """Return the MOC for a nested folder, creating it and linking it from the
+    parent folder's MOC if needed. `name` overrides the MOC title (used for the
+    monthly session MOCs that live in projects/ itself)."""
+    title = name or folder.name.replace("-", " ").title()
+    moc = folder / f"{title} MOC.md"
+    if moc.exists():
+        return moc
+    parent_dir = folder if name else folder.parent
+    parent = _find_moc(parent_dir) if parent_dir != VAULT_PATH else None
+    if parent is None and parent_dir != VAULT_PATH and parent_dir.parent != VAULT_PATH:
+        parent = ensure_sub_moc(parent_dir)
+    up = f"Up: [[{parent.stem}]]\n\n" if parent else ""
+    rel = folder.relative_to(VAULT_PATH)
+    moc.write_text(f"""---
+topic: {rel.parts[0]}
+tags:
+  - moc
+  - sub-moc
+last_updated: {date.today().isoformat()}
+---
+
+# {title}
+
+{up}## Notes
+""")
+    if parent:
+        _add_line_under(parent, "## Sub-MOCs", f"- [[{moc.stem}]]")
+    return moc
+
+
+def _month_of(note_path: Path) -> str:
+    m = re.search(r"(20\d\d)-(\d\d)", note_path.name)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
+    head = note_path.read_text(errors="ignore")[:400]
+    m = re.search(r"last_updated:\s*'?(20\d\d)-(\d\d)", head)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
+    from datetime import datetime
+    return datetime.fromtimestamp(note_path.stat().st_mtime).strftime("%Y-%m")
+
+
+def moc_for_note(note_path: Path) -> Path | None:
+    """Nearest MOC for a note: its own folder's (sub-)MOC, or for the flat
+    projects/ root, a monthly "Projects YYYY-MM MOC" index."""
+    rel = note_path.resolve().relative_to(VAULT_PATH.resolve())
+    folder = VAULT_PATH / rel.parent
+    if len(rel.parts) == 1:
+        return None
+    if len(rel.parts) == 2:
+        if rel.parts[0] in SYSTEM_FOLDERS:
+            return ensure_sub_moc(folder, name=f"{rel.parts[0].title()} {_month_of(note_path)}")
+        return _find_moc(folder)
+    return ensure_sub_moc(folder)
+
+
+def link_note_in_moc(note_path: Path) -> None:
+    """Add a [[link]] to note_path in its nearest MOC.
+
+    Notes only linked *to* their MOC (footer) still show as orphans: nothing
+    points at them. This gives each note one incoming link.
+    """
+    try:
+        moc = moc_for_note(note_path)
+    except ValueError:
+        return
+    if moc is None or moc.resolve() == note_path.resolve() or note_path.name.endswith(" MOC.md"):
+        return
+    _add_line_under(moc, "## Notes", f"- [[{note_path.stem}]]")
 
 
 # ---------------------------------------------------------------------------

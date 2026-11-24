@@ -131,7 +131,7 @@ async def _do_remember(
         if domain:
             # Agent knows the domain — use it directly. No embedding work here:
             # a new domain's MOC is bootstrapped AFTER the note is on disk.
-            return domain.strip().lower().replace(" ", "-")
+            return classifier.canonical_domain(domain.strip().lower().replace(" ", "-"))
         return classify(content)
 
     # A timed-out wait_for does NOT stop its worker thread; that thread kept
