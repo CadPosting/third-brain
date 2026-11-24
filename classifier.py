@@ -145,6 +145,8 @@ def link_note_in_moc(note_path: Path) -> None:
             i += 1
         lines.insert(i, line)
         text = head + "## Notes" + "\n".join(lines)
+        if not text.endswith("\n"):
+            text += "\n"
     else:
         text = text.rstrip() + f"\n\n## Notes\n\n{line}\n"
     moc.write_text(text)

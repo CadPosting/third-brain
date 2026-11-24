@@ -114,6 +114,10 @@ async def _do_remember(
     """Core write path shared by the MCP `remember` tool and the /remember
     HTTP route (used by the session fact-extractor hook)."""
     tags = tags or []
+    # domain becomes a filesystem path. Both MCP and HTTP callers can be LLMs
+    # reading untrusted text, so block traversal here, not only in the route.
+    if domain and (".." in domain or domain.startswith("/") or "\\" in domain):
+        return {"status": "error", "reason": "invalid domain"}
 
     # The classify() branch runs embedding work (_score_against_mocs embeds the
     # content against every domain MOC; classify() does the same internally and
