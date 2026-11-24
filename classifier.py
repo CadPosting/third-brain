@@ -385,7 +385,9 @@ def _add_backlinks(new_domain: str, related_domains: list[str]):
 
 def resolve_vault_path(folder: str, title: str) -> Path:
     """Build full filesystem path for a note given its folder and title."""
-    safe_title = title.lower().replace(" ", "-").replace("/", "-")[:60]
+    # #, |, ^, [ and ] break [[wiki-links]] in Obsidian (# is read as a
+    # heading anchor), so a note named with them can never be linked to.
+    safe_title = re.sub(r"[#|^\[\]]", "", title.lower().replace(" ", "-").replace("/", "-"))[:60]
     return VAULT_PATH / folder / f"{safe_title}.md"
 
 
