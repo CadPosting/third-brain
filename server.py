@@ -215,7 +215,11 @@ async def _do_remember(
             related = classifier.related_domains(classifier._score_against_mocs(content))
             classifier._bootstrap_domain(folder.split("/")[0], content, related)
         classifier.link_note_in_moc(note_path)
-        return index_file(str(note_path))
+        n = index_file(str(note_path))
+        # Also link from other topic MOCs it fits (needs the index entry above).
+        import cross_link
+        cross_link.link_note(note_path)
+        return n
 
     chunks = 0
     try:
