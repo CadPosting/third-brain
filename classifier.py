@@ -391,7 +391,8 @@ def resolve_vault_path(folder: str, title: str) -> Path:
     return VAULT_PATH / folder / f"{safe_title}.md"
 
 
-def build_frontmatter(topic: str, subtopic: str, tags: list[str], agent: str) -> str:
+def build_frontmatter(topic: str, subtopic: str, tags: list[str], agent: str,
+                      status: str | None = None) -> str:
     parts = topic.split("/")
     t = parts[0] if parts else topic
     st = parts[1] if len(parts) > 1 else subtopic
@@ -404,7 +405,7 @@ topic: {t}
 subtopic: {st}
 {tag_block}
 agent: {agent}
-last_updated: {date.today().isoformat()}
+{f"status: {status}" + chr(10) if status else ""}last_updated: {date.today().isoformat()}
 ---
 
 """

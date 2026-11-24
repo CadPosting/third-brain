@@ -6,6 +6,7 @@ Runs as a persistent HTTP server on http://127.0.0.1:7891/mcp
 Managed by systemd: systemctl --user start third-brain
 """
 import os
+import re
 import sys
 import asyncio
 import hashlib
@@ -30,7 +31,15 @@ VAULT_PATH = Path.home() / "vault"
 # a near-duplicate sibling. Calibrated start point; lower toward 0.80 if dupes
 # still slip through. Disable entirely with TB_DEDUP=0.
 DEDUP_SIM = 0.85
-DEDUP_MAX_BYTES = 8192  # don't accrete into a note past this size — make a new one
+DEDUP_MAX_BYTES = 8192
+STATUSES = {"open", "done"}
+
+# "What's left / what should I work on" style queries. For these, recall pulls
+# in open notes and ranks them first, since embeddings alone rank old session
+# chatter about a topic above the backlog note that tracks it.
+TODO_INTENT = re.compile(
+    r"\b(todo|to-do|to do|backlog|pending|open (items|tasks|issues)|left to do|"
+    r"what'?s left|remaining|next steps?|work on next|unfinished|outstanding)\b", re.I)  # don't accrete into a note past this size — make a new one
 
 mcp = FastMCP("third-brain")
 
@@ -40,6 +49,7 @@ async def recall(
     query: str,
     top_k: int = 5,
     topic_filter: str = None,
+    status_filter: str = None,
 ) -> list[dict]:
     """
     Search Third Brain for relevant knowledge.
@@ -49,6 +59,7 @@ async def recall(
         query: What you want to find. Natural language.
         top_k: Number of results to return (default 5).
         topic_filter: Limit to a domain e.g. 'machine-learning', 'hpc', 'web-development'.
+        status_filter: 'open' or 'done' — only notes with that frontmatter status.
     """
     # Stage tracing, off unless TB_TRACE=1. This is what localised the reranker
     # deadlock (every stage before rerank finished in 0.3s); keep it available,
@@ -60,12 +71,23 @@ async def recall(
             print(f"[recall] {msg}", file=sys.stderr, flush=True)
     _t0 = _t.time()
     _stage(f"start query={query!r} top_k={top_k}")
+    todo_query = bool(TODO_INTENT.search(query))
     vec = vector_search(query, top_k=20, topic_filter=topic_filter)
     _stage(f"vector_search done n={len(vec)} t={_t.time()-_t0:.1f}s")
     bm25 = bm25_search(query, top_k=20)
     _stage(f"bm25_search done n={len(bm25)} t={_t.time()-_t0:.1f}s")
     merged = rrf_merge(vec, bm25)
     _stage(f"rrf_merge done n={len(merged)} t={_t.time()-_t0:.1f}s")
+
+    if todo_query or status_filter:
+        # Open notes are few; add their chunks as candidates so the reranker
+        # sees them even when vector/BM25 ranked them low.
+        wanted = status_filter or "open"
+        flagged = _notes_with_status(wanted)
+        seen = {m["id"] for m in merged}
+        merged += [d for d in indexer_docs() if d["source_path"] in flagged and d["id"] not in seen]
+        if status_filter:
+            merged = [m for m in merged if m.get("source_path") in flagged]
 
     # Add graph results if available
     if graph_available():
@@ -82,7 +104,7 @@ async def recall(
     import asyncio
     try:
         reranked = await asyncio.wait_for(
-            asyncio.to_thread(rerank, query, merged, top_k=top_k), timeout=25
+            asyncio.to_thread(rerank, query, merged, top_k=len(merged) if todo_query else top_k), timeout=25
         )
         _stage(f"rerank done n={len(reranked)} t={_t.time()-_t0:.1f}s")
     except (asyncio.TimeoutError, RuntimeError, ValueError, OSError) as e:
@@ -92,6 +114,21 @@ async def recall(
               f"t={_t.time()-_t0:.1f}s — returning RRF-merged results unreranked",
               file=sys.stderr, flush=True)
         reranked = merged[:top_k]
+
+    if todo_query:
+        # Stable sort: open notes first, reranker order kept within each group.
+        open_notes = _notes_with_status("open")
+        reranked = sorted(reranked, key=lambda r: r.get("source_path") not in open_notes)
+        # One chunk per open note, so a long backlog note can't fill every slot.
+        seen_open, kept = set(), []
+        for r in reranked:
+            sp = r.get("source_path")
+            if sp in open_notes:
+                if sp in seen_open:
+                    continue
+                seen_open.add(sp)
+            kept.append(r)
+        reranked = kept[:top_k]
 
     return [
         {
@@ -110,6 +147,7 @@ async def _do_remember(
     agent: str = "agent",
     tags: list[str] = None,
     domain: str = None,
+    status: str = None,
 ) -> dict:
     """Core write path shared by the MCP `remember` tool and the /remember
     HTTP route (used by the session fact-extractor hook)."""
@@ -118,6 +156,8 @@ async def _do_remember(
     # reading untrusted text, so block traversal here, not only in the route.
     if domain and (".." in domain or domain.startswith("/") or "\\" in domain):
         return {"status": "error", "reason": "invalid domain"}
+    if status and status not in STATUSES:
+        return {"status": "error", "reason": f"status must be one of {sorted(STATUSES)}"}
 
     # The classify() branch runs embedding work (_score_against_mocs embeds the
     # content against every domain MOC; classify() does the same internally and
@@ -200,9 +240,11 @@ async def _do_remember(
         existing = fm.load(str(note_path))
         existing.content += f"\n\n---\n*{agent} — {datetime.now().strftime('%Y-%m-%d %H:%M')}*\n\n{content}"
         existing.metadata["last_updated"] = date.today().isoformat()
+        if status:
+            existing.metadata["status"] = status
         _atomic_write(note_path, fm.dumps(existing))
     else:
-        frontmatter_str = build_frontmatter(folder, "", tags, agent)
+        frontmatter_str = build_frontmatter(folder, "", tags, agent, status)
         frontmatter_str = frontmatter_str.replace(
             "\n---\n\n", f"\ncontent_hash: {content_hash}\n---\n\n", 1)
         moc_stem = classifier._moc_filename(folder.split("/")[0])[:-3]
@@ -261,6 +303,7 @@ async def remember(
     agent: str = "agent",
     tags: list[str] = None,
     domain: str = None,
+    status: str = None,
 ) -> dict:
     """
     Save a piece of knowledge to Third Brain.
@@ -280,8 +323,12 @@ async def remember(
         tags:    Optional list of tags.
         domain:  Explicit domain name or subfolder (e.g. 'networking',
                  'machine-learning/alignment'). Preferred over auto-classify.
+        status:  For tasks/backlog items: 'open' or 'done'. Re-remember with the
+                 same title and status='done' to close one. Open notes are
+                 ranked first when recall is asked what is left to do.
     """
-    return await _do_remember(content, title=title, agent=agent, tags=tags, domain=domain)
+    return await _do_remember(content, title=title, agent=agent, tags=tags,
+                              domain=domain, status=status)
 
 
 @mcp.tool()
@@ -359,6 +406,16 @@ last_updated: {datetime.now().strftime('%Y-%m-%d')}
 """)
 
     chunks = index_file(str(note_path))
+
+    # Keep the per-project session log current (consolidate_sessions.py).
+    def _log():
+        import consolidate_sessions
+        consolidate_sessions.add_session(note_path)
+    try:
+        await asyncio.wait_for(asyncio.to_thread(_log), timeout=60)
+    except (asyncio.TimeoutError, OSError, ValueError, RuntimeError) as e:
+        print(f"[summarize_session] session-log update failed ({type(e).__name__})",
+              file=sys.stderr, flush=True)
 
     if graph_available():
         await add_episode(summary, source=agent)
@@ -479,10 +536,37 @@ async def remember_endpoint(request) -> "Response":
             agent=body.get("agent", "agent"),
             tags=body.get("tags"),
             domain=domain,
+            status=body.get("status"),
         )
         return JSONResponse(result)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+def _notes_with_status(status: str) -> set[str]:
+    """Paths of vault notes whose frontmatter has `status: <status>`.
+
+    A plain scan of frontmatter heads: ~1,000 small files, a few ms, and always
+    current (no index schema change needed)."""
+    out = set()
+    for p in VAULT_PATH.rglob("*.md"):
+        if ".trash" in p.parts:
+            continue
+        try:
+            with open(p, errors="ignore") as f:
+                head = f.read(600)
+        except OSError:
+            continue
+        if re.search(rf"^status:\s*{status}\s*$", head, re.M):
+            out.add(str(p))
+    return out
+
+
+def indexer_docs() -> list[dict]:
+    """All indexed chunks (the BM25 cache already holds them in memory)."""
+    import indexer
+    indexer.bm25_search("x", top_k=1)  # refreshes the cache if the table moved
+    return indexer._bm25_docs
 
 
 def _auto_title(content: str) -> str:
