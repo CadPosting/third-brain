@@ -43,9 +43,29 @@ def classify(content: str, fallback_path: str = "general") -> str:
 
     # New domain — infer name from content and bootstrap it
     domain_name = _infer_domain_name(content)
-    related = [d for d, s in moc_scores.items() if s > 0.15]
+    related = related_domains(moc_scores)
     _bootstrap_domain(domain_name, content, related)
     return domain_name
+
+
+# MOC vectors keyed by (path, mtime). Re-embedding all ~24 MOCs on every call
+# is what pushed folder resolution past its 60s timeout on 2026-11-24 when the
+# server was under memory pressure. MOCs rarely change, so embed each once.
+_moc_vec_cache: dict[str, tuple[float, list[float]]] = {}
+
+
+def _moc_vector(moc: Path) -> list[float] | None:
+    from embedder import embed_passage
+    mtime = moc.stat().st_mtime
+    hit = _moc_vec_cache.get(str(moc))
+    if hit and hit[0] == mtime:
+        return hit[1]
+    moc_text = moc.read_text(errors="ignore")[:1500]
+    if not moc_text.strip():
+        return None
+    vec = embed_passage(moc_text)
+    _moc_vec_cache[str(moc)] = (mtime, vec)
+    return vec
 
 
 def _score_against_mocs(content: str) -> dict[str, float]:
@@ -73,15 +93,61 @@ def _score_against_mocs(content: str) -> dict[str, float]:
         if moc is None:
             continue
 
-        moc_text = moc.read_text(errors="ignore")[:1500]
-        if not moc_text.strip():
+        moc_vec = _moc_vector(moc)
+        if moc_vec is None:
             continue
-
-        moc_vec = embed(moc_text)
         similarity = float(np.dot(content_vec, moc_vec))  # both normalized
         scores[domain_dir.name] = similarity
 
     return scores
+
+
+def related_domains(scores: dict[str, float], limit: int = 3) -> list[str]:
+    """Pick the domains a new MOC should cross-link to.
+
+    The old rule was "every domain scoring > 0.15, first 5". BGE cosine scores
+    for any two English texts sit around 0.4-0.7, so 0.15 let in every domain,
+    and "first 5" was directory order, not best match. That is how sock-studio
+    got linked to research-integrity. Now: best first, and only domains close
+    to the top score.
+    """
+    if not scores:
+        return []
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    best = ranked[0][1]
+    return [d for d, s in ranked[:limit] if s >= 0.5 and s >= best - 0.05]
+
+
+def link_note_in_moc(note_path: Path) -> None:
+    """Add a [[link]] to note_path under the "## Notes" section of its domain MOC.
+
+    Notes only linked *to* their MOC (footer) still show as orphans: nothing
+    points at them. This gives each note one incoming link.
+    """
+    try:
+        rel = note_path.resolve().relative_to(VAULT_PATH.resolve())
+    except ValueError:
+        return
+    moc = _find_moc(VAULT_PATH / rel.parts[0])
+    if moc is None or moc.resolve() == note_path.resolve():
+        return
+    link = f"[[{note_path.stem}]]"
+    text = moc.read_text(errors="ignore")
+    if link in text:
+        return
+    line = f"- {link}"
+    if "## Notes" in text:
+        head, _, tail = text.partition("## Notes")
+        # Insert after the heading's own line (and any blockquote placeholder).
+        lines = tail.split("\n")
+        i = 1
+        while i < len(lines) and (lines[i].startswith(">") or not lines[i].strip()):
+            i += 1
+        lines.insert(i, line)
+        text = head + "## Notes" + "\n".join(lines)
+    else:
+        text = text.rstrip() + f"\n\n## Notes\n\n{line}\n"
+    moc.write_text(text)
 
 
 # ---------------------------------------------------------------------------

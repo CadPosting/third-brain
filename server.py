@@ -6,8 +6,11 @@ Runs as a persistent HTTP server on http://127.0.0.1:7891/mcp
 Managed by systemd: systemctl --user start third-brain
 """
 import os
+import sys
+import asyncio
+import hashlib
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, date
 import frontmatter as fm
 
 from fastmcp import FastMCP
@@ -112,7 +115,7 @@ async def _do_remember(
     HTTP route (used by the session fact-extractor hook)."""
     tags = tags or []
 
-    # Both branches below run embedding work (_score_against_mocs embeds the
+    # The classify() branch runs embedding work (_score_against_mocs embeds the
     # content against every domain MOC; classify() does the same internally and
     # was measured at 20.8s standalone). They are synchronous, so calling them
     # directly here blocks FastMCP's event loop for the whole duration — which is
@@ -122,44 +125,49 @@ async def _do_remember(
 
     def _resolve_folder() -> str:
         if domain:
-            # Agent knows the domain — use it directly.
-            folder = domain.strip().lower().replace(" ", "-")
-            # Bootstrap a MOC only for a genuinely new domain. For an existing
-            # one this whole branch is skipped, which avoids the MOC-scoring
-            # embed entirely on the common path.
-            domain_dir = classifier.VAULT_PATH / folder.split("/")[0]
-            if classifier._find_moc(domain_dir) is None:
-                related = [
-                    d for d, s in classifier._score_against_mocs(content).items() if s > 0.15
-                ]
-                classifier._bootstrap_domain(folder.split("/")[0], content, related)
-            return folder
+            # Agent knows the domain — use it directly. No embedding work here:
+            # a new domain's MOC is bootstrapped AFTER the note is on disk.
+            return domain.strip().lower().replace(" ", "-")
         return classify(content)
 
+    # A timed-out wait_for does NOT stop its worker thread; that thread kept
+    # embedding and created the sock-studio MOC after we had given up on it.
+    # With an explicit domain _resolve_folder is now instant, so only the
+    # classify() path can time out.
     try:
         folder = await asyncio.wait_for(asyncio.to_thread(_resolve_folder), timeout=60)
     except asyncio.TimeoutError:
-        # Never lose a write to a slow classifier. An explicit domain is already
-        # the caller's answer; without one, park the note in `inbox` so it is on
-        # disk and indexed, and can be refiled later.
-        folder = (domain.strip().lower().replace(" ", "-") if domain else "inbox")
-        print(f"[remember] folder resolution timed out — using {folder!r}",
-              file=__import__("sys").stderr, flush=True)
+        # Never lose a write to a slow classifier: park it in `inbox`.
+        folder = "inbox"
+        print("[remember] folder resolution timed out — using 'inbox'",
+              file=sys.stderr, flush=True)
+
+    domain_dir = VAULT_PATH / folder.split("/")[0]
+    new_domain = classifier._find_moc(domain_dir) is None
+    content_hash = hashlib.sha256(content.strip().encode()).hexdigest()[:16]
+
+    # Idempotency: a client that lost the connection and retries must not get
+    # a second copy. The hash is stored in each new note's frontmatter, and
+    # appended blocks are matched by their raw text.
+    if domain_dir.exists():
+        for p in domain_dir.rglob("*.md"):
+            try:
+                text = p.read_text(errors="ignore")
+            except OSError:
+                continue
+            if f"content_hash: {content_hash}" in text or (
+                    len(content.strip()) >= 40 and content.strip() in text):
+                return {"status": "duplicate", "path": str(p), "folder": folder,
+                        "chunks_indexed": 0, "deduped_into": None,
+                        "new_domain_created": False}
 
     title = title or _auto_title(content)
     note_path = resolve_vault_path(folder, title)
     note_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Write-time dedup. Only worth attempting when the title doesn't already
-    # resolve to an existing note (that case is handled by the append branch
-    # below). If a same-domain note is similar enough and passes the rails,
-    # redirect the write into it so it appends instead of creating a sibling.
+    # Write-time dedup into a same-domain near-duplicate.
     deduped_into = None
     if os.environ.get("TB_DEDUP", "1") != "0" and not note_path.exists():
-        # Also embedding work, also synchronous — same event-loop reasoning as
-        # the folder resolution above. Measured at 0.2s, so the timeout here is
-        # a guard rather than an expected path; on timeout we simply skip dedup
-        # and write a new note, which is the safe direction to fail.
         try:
             match = await asyncio.wait_for(
                 asyncio.to_thread(find_similar_note, content, str(note_path.parent) + "/"),
@@ -168,34 +176,50 @@ async def _do_remember(
         except asyncio.TimeoutError:
             match = None
             print("[remember] dedup lookup timed out — writing a new note",
-                  file=__import__("sys").stderr, flush=True)
+                  file=sys.stderr, flush=True)
         if match:
             cand_path, sim = match
             cand = Path(cand_path)
             is_moc = "MOC" in cand.name or cand.name == "HOME.md"
             small_enough = cand.exists() and cand.stat().st_size <= DEDUP_MAX_BYTES
-            if sim >= DEDUP_SIM and not is_moc and small_enough:
+            # Same subject, different event is not a duplicate: on 2026-11-24 a
+            # new UK-page change was merged into an Oct 30 note about the same
+            # page. Only merge into a note last touched today.
+            same_day = cand.exists() and _last_updated(cand) == date.today().isoformat()
+            if sim >= DEDUP_SIM and not is_moc and small_enough and same_day:
                 note_path = cand
                 deduped_into = cand_path
 
-    # Append to existing note or create new
+    # Write the note FIRST, atomically (tmp + os.replace), so a crash at any
+    # later step (indexing, MOC bootstrap, graph) cannot lose it.
     if note_path.exists():
         existing = fm.load(str(note_path))
         existing.content += f"\n\n---\n*{agent} — {datetime.now().strftime('%Y-%m-%d %H:%M')}*\n\n{content}"
-        with open(note_path, "w") as f:
-            f.write(fm.dumps(existing))
+        existing.metadata["last_updated"] = date.today().isoformat()
+        _atomic_write(note_path, fm.dumps(existing))
     else:
         frontmatter_str = build_frontmatter(folder, "", tags, agent)
-        # Link back to the domain MOC so the note isn't an orphan in Obsidian's
-        # graph — without this, every remember() note had zero links.
-        moc = classifier._find_moc(VAULT_PATH / folder.split("/")[0])
-        footer = f"\n\n---\n*[[{moc.stem}]]*\n" if moc and moc.stem.endswith(" MOC") else ""
-        note_path.write_text(frontmatter_str + content + footer)
+        frontmatter_str = frontmatter_str.replace(
+            "\n---\n\n", f"\ncontent_hash: {content_hash}\n---\n\n", 1)
+        moc_stem = classifier._moc_filename(folder.split("/")[0])[:-3]
+        footer = f"\n\n---\n*[[{moc_stem}]]*\n"
+        _atomic_write(note_path, frontmatter_str + content + footer)
 
-    # Index the note
-    chunks = index_file(str(note_path))
+    # Everything below is best-effort: the note is already safe on disk.
+    def _post_write() -> int:
+        if new_domain:
+            related = classifier.related_domains(classifier._score_against_mocs(content))
+            classifier._bootstrap_domain(folder.split("/")[0], content, related)
+        classifier.link_note_in_moc(note_path)
+        return index_file(str(note_path))
 
-    # Add to knowledge graph
+    chunks = 0
+    try:
+        chunks = await asyncio.wait_for(asyncio.to_thread(_post_write), timeout=60)
+    except (asyncio.TimeoutError, OSError, ValueError, RuntimeError) as e:
+        print(f"[remember] post-write step failed ({type(e).__name__}); note is saved, "
+              f"watcher will index it", file=sys.stderr, flush=True)
+
     if graph_available():
         await add_episode(content, source=agent)
 
@@ -205,10 +229,21 @@ async def _do_remember(
         "folder": folder,
         "chunks_indexed": chunks,
         "deduped_into": deduped_into,
-        "new_domain_created": classifier._find_moc(
-            VAULT_PATH / folder.split("/")[0]
-        ) is None,
+        "new_domain_created": new_domain,
     }
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def _last_updated(path: Path) -> str:
+    try:
+        return str(fm.load(str(path)).metadata.get("last_updated", ""))
+    except (OSError, ValueError):
+        return ""
 
 
 @mcp.tool()
@@ -384,10 +419,18 @@ async def search_endpoint(request) -> "Response":
         min_score = float(body.get("min_score", 0.0))
         if not query:
             return JSONResponse([], status_code=200)
-        vec = vector_search(query, top_k=top_k * 4)
-        bm25 = bm25_search(query, top_k=top_k * 4)
-        merged = rrf_merge(vec, bm25)
-        results = rerank(query, merged, top_k=top_k)
+        # Run off the event loop: called inline, an 8s rerank under memory
+        # pressure froze the whole server, so concurrent MCP calls (remember)
+        # could not be answered. Same pattern as recall().
+        def _search():
+            vec = vector_search(query, top_k=top_k * 4)
+            bm25 = bm25_search(query, top_k=top_k * 4)
+            merged = rrf_merge(vec, bm25)
+            try:
+                return rerank(query, merged, top_k=top_k)
+            except (RuntimeError, ValueError, OSError):
+                return merged[:top_k]
+        results = await asyncio.wait_for(asyncio.to_thread(_search), timeout=25)
         trimmed = [
             {
                 "source_path": r.get("source_path", ""),
@@ -458,6 +501,7 @@ def _startup_integrity_check():
     try:
         indexer.vector_search("startup probe", top_k=1)
         print("[startup] Index OK.", file=sys.stderr)
+        _compact_index()
         return
     except Exception as e:
         print(f"[startup] Index check failed: {e}", file=sys.stderr)
@@ -484,6 +528,25 @@ def _startup_integrity_check():
         except Exception as fe:
             print(f"[startup] Warning: failed to index {f.name}: {fe}", file=sys.stderr)
     print(f"[startup] Rebuilt index: {total} chunks from {len(files)} files.", file=sys.stderr)
+
+
+def _compact_index():
+    """Merge LanceDB fragments and drop old versions.
+
+    Every index_file() is a delete + add, and nothing ever compacted, so by
+    2026-11-24 the table had 2,047 fragments and 1,921 versions for ~1,000
+    notes. Every search had to open all of them. The index is a cache of the
+    vault, so pruning history loses nothing.
+    """
+    import sys
+    from datetime import timedelta
+    import indexer
+    try:
+        t = indexer._get_table()
+        t.optimize(cleanup_older_than=timedelta(hours=1))
+        print("[startup] Index compacted.", file=sys.stderr)
+    except Exception as e:  # noqa: BLE001 — compaction is optional, never block startup
+        print(f"[startup] Compaction skipped: {e}", file=sys.stderr)
 
 
 def _warmup():
